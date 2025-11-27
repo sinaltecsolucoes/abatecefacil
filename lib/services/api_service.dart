@@ -1,18 +1,44 @@
-import 'dart:async';
-import 'package:flutter/foundation.dart';
-import 'package:flutter_inappwebview/flutter_inappwebview.dart';
-import 'package:html/parser.dart' as parser;
-import 'package:http/http.dart' as http; // Mantemos para o login
 import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:flutter/foundation.dart';
 
 class ApiService {
-  static const String baseUrl = "http://10.0.0.250/api-abastece";
+  static const String _infoSimplesToken =
+      "3eA72go_IGOCn7Xvikd2iLVECaKi1UL5tX11mzpI";
 
-  /// Login (Mantemos via HTTP normal pois é sua API interna)
+  // Endpoints da InfoSimples
+  static const Map<String, String> _endpoints = {
+    'ce_nfce': 'https://api.infosimples.com/api/v2/consultas/sefaz/ce/nfce',
+    'ce_cfe':
+        'https://api.infosimples.com/api/v2/consultas/sefaz/ce/cfe', // MFE Ceará
+    'ba': 'https://api.infosimples.com/api/v2/consultas/sefaz/ba/nfce',
+    'ma': 'https://api.infosimples.com/api/v2/consultas/sefaz/ma/nfce',
+    'pb': 'https://api.infosimples.com/api/v2/consultas/sefaz/pb/nfce',
+    'pe': 'https://api.infosimples.com/api/v2/consultas/sefaz/pe/nfce',
+    'pi': 'https://api.infosimples.com/api/v2/consultas/sefaz/pi/nfce',
+    'rn': 'https://api.infosimples.com/api/v2/consultas/sefaz/rn/nfce-resumida',
+  };
+
+  // Mapa de Códigos IBGE para Sigla do Estado
+  // Os dois primeiros dígitos da chave dizem de onde ela é
+  static const Map<String, String> _codigoIbgeEstados = {
+    '21': 'ma',
+    '22': 'pi',
+    '23': 'ce',
+    '24': 'rn',
+    '25': 'pb',
+    '26': 'pe',
+    '29': 'ba',
+  };
+
+  static const String baseUrl = "http://10.0.0.250/api-abastece";
+  static final Map<String, Map<String, dynamic>> _cache = {};
+
   static Future<Map<String, dynamic>> login(String login, String senha) async {
     try {
+      final uri = Uri.parse("$baseUrl/login.php");
       final response = await http.post(
-        Uri.parse("$baseUrl/login.php"),
+        uri,
         headers: {"Content-Type": "application/json"},
         body: json.encode({"login": login, "senha": senha}),
       );
@@ -22,153 +48,362 @@ class ApiService {
     }
   }
 
-  /// Consulta NFC-e usando Headless WebView (Navegador Invisível)
-  /// Isso "engana" a SEFAZ pois é um navegador real renderizando a página.
-  static Future<Map<String, dynamic>> consultarNFCe(String url) async {
-    final completer = Completer<Map<String, dynamic>>();
-    HeadlessInAppWebView? headlessWebView;
-
+  static Future<Map<String, dynamic>> consultarNFCe(String urlQrCode) async {
     try {
-      debugPrint("DEBUG: Iniciando WebView Invisível para: $url");
+      final chave = _extrairChave(urlQrCode);
+      if (chave.length != 44) {
+        return {"status": "ERRO", "mensagem": "Chave inválida (44 dígitos)."};
+      }
 
-      headlessWebView = HeadlessInAppWebView(
-        initialUrlRequest: URLRequest(url: WebUri(url)),
-        initialSettings: InAppWebViewSettings(
-          isInspectable: true, // Útil para debug
-          javaScriptEnabled: true, // Essencial: A SEFAZ exige JS
-          userAgent: // Fingimos ser um Chrome Android padrão
-              "Mozilla/5.0 (Linux; Android 10; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.88 Mobile Safari/537.36",
-        ),
-        onLoadStop: (controller, url) async {
-          debugPrint("DEBUG: Página carregada. Extraindo HTML...");
+      if (_cache.containsKey(chave)) {
+        debugPrint("⚡ CACHE RÁPIDO: Retornando dados da memória.");
+        return _cache[chave]!;
+      }
 
-          // Aguarda um pouco para garantir que scripts da SEFAZ rodaram (opcional, mas seguro)
-          await Future.delayed(const Duration(milliseconds: 500));
+      // --- INTELIGÊNCIA PELA CHAVE DE ACESSO ---
 
-          final html = await controller.getHtml();
+      // 1. Identifica o Estado (2 primeiros dígitos)
+      final codigoIbge = chave.substring(0, 2);
+      final estado =
+          _codigoIbgeEstados[codigoIbge] ?? 'ce'; // Padrão CE se não achar
 
-          if (html != null && html.isNotEmpty) {
-            // Verifica se tem dados reais ou se é página de erro
-            if (html.contains("txtTopo") || html.contains("txtTit")) {
-              final dados = _parseHtml(html, url.toString());
-              if (!completer.isCompleted) {
-                completer.complete({"status": "OK", "dados": dados});
-              }
-            } else {
-              // Se carregou mas não tem as classes, pode ser captcha ou erro
-              debugPrint("DEBUG: HTML carregado mas sem classes esperadas.");
-              if (!completer.isCompleted) {
-                // Tenta parsear mesmo assim, ou retorna erro
-                final dados = _parseHtml(html, url.toString());
-                completer.complete({"status": "OK", "dados": dados});
-              }
-            }
-          } else {
-            if (!completer.isCompleted) {
-              completer.complete({"status": "ERRO", "mensagem": "HTML Vazio"});
-            }
-          }
-          // Fecha o navegador para economizar memória
-          await headlessWebView?.dispose();
-        },
-        onLoadError: (controller, url, code, message) {
-          debugPrint("DEBUG: Erro no WebView: $message");
-          if (!completer.isCompleted) {
-            completer.complete(
-                {"status": "ERRO", "mensagem": "Falha webview: $message"});
-            headlessWebView?.dispose();
-          }
-        },
-      );
+      // 2. Identifica o Modelo (Dígitos 20 e 21) -> 59=SAT, 65=NFCe
+      final modelo = chave.substring(20, 22);
 
-      // Inicia o navegador e carrega a página
-      await headlessWebView.run();
+      String endpoint;
+      String paramName;
 
-      // Timeout de segurança: Se em 20s não carregar, cancela
-      return completer.future.timeout(const Duration(seconds: 20),
-          onTimeout: () {
-        headlessWebView?.dispose();
+      // Lógica de Roteamento
+      if (modelo == '59' && estado == 'ce') {
+        // MFE/SAT do Ceará
+        endpoint = _endpoints['ce_cfe']!;
+        paramName = 'chave';
+      } else {
+        // NFC-e (Qualquer estado) ou SAT de outros estados (se houver no futuro)
+        endpoint = _endpoints[estado] ?? _endpoints['ce_nfce']!;
+        paramName = 'nfce';
+      }
+
+      debugPrint("🔍 Análise da Chave: UF=$codigoIbge($estado) | Mod=$modelo");
+      debugPrint("🚀 Endpoint escolhido: $endpoint");
+
+      // 3. Monta a URL
+      final uri = Uri.parse(endpoint).replace(queryParameters: {
+        "token": _infoSimplesToken,
+        "timeout": "120",
+        "arquivos": "0",
+        "original": "0",
+        paramName: chave,
+      });
+
+      final response = await http.get(uri).timeout(const Duration(seconds: 25));
+
+      if (response.statusCode == 200) {
+        final jsonResponse = json.decode(response.body);
+
+        if (jsonResponse['code'] == 200 &&
+            jsonResponse['data'] is List &&
+            jsonResponse['data'].isNotEmpty) {
+          final resultado = _mapInfoSimplesToApp(jsonResponse['data'][0]);
+          _cache[chave] = resultado;
+          return resultado;
+        } else {
+          final msg = jsonResponse['code_message'] ?? "Erro na API";
+          return {"status": "ERRO", "mensagem": "InfoSimples: $msg"};
+        }
+      } else {
         return {
           "status": "ERRO",
-          "mensagem": "Tempo limite excedido (Timeout)"
+          "mensagem": "Erro HTTP ${response.statusCode}"
         };
-      });
+      }
     } catch (e) {
-      return {"status": "ERRO", "mensagem": "Exceção: $e"};
+      return {"status": "ERRO", "mensagem": "Sem resposta (Timeout)."};
     }
   }
 
-  /// Parser Ajustado para SEFAZ CE
-  static Map<String, dynamic> _parseHtml(String html, String url) {
-    final document = parser.parse(html);
+  static String _extrairChave(String url) {
+    final regex = RegExp(r'\d{44}');
+    return regex.firstMatch(url)?.group(0) ?? "";
+  }
 
-    // --- Parser Ceará ---
-    // Mesmo que a URL mude, se o HTML tiver a estrutura da SEFAZ CE, usaremos este bloco
-    if (url.contains("sefaz.ce.gov.br") || html.contains("txtTopo")) {
-      final nomePosto = document.querySelector('.txtTopo')?.text.trim() ??
-          'Posto não identificado';
+  /*static Map<String, dynamic> _mapInfoSimplesToApp(Map<String, dynamic> data) {
+    try {
+      final emitente = data['emitente'] ?? {};
+      final nfe = data['nfe'] ?? {};
+      final totais = data['totais'] ?? {};
+      final produtos = data['produtos'] as List? ?? [];
 
-      // Busca CNPJ
-      String cnpjPosto = '';
-      final divs = document.querySelectorAll('.text');
-      for (var div in divs) {
-        if (div.text.contains('CNPJ')) {
-          cnpjPosto = div.text.replaceAll('CNPJ:', '').trim();
-          break;
+      // DATA
+      String rawDate = nfe['data_emissao'] ??
+          data['data_emissao'] ??
+          data['data_hora_emissao'] ??
+          DateTime.now().toString();
+      final dataEmissao = _formatarDataUniversal(rawDate);
+
+      // DEMAIS CAMPOS
+      final cupom =
+          nfe['numero']?.toString() ?? data['numero_cfe']?.toString() ?? '0';
+      final cnpjPuro = emitente['normalizado_cnpj']?.toString() ??
+          emitente['cnpj']?.toString().replaceAll(RegExp(r'\D'), '') ??
+          '';
+      final nomePosto = emitente['nome_fantasia'] ??
+          emitente['nome'] ??
+          emitente['nome_razao_social'] ??
+          'Posto';
+
+      double valorTotalNota = _toDouble(totais['normalizado_valor_nfe'] ??
+          totais['valor_nfe'] ??
+          data['normalizado_valor_total'] ??
+          data['valor_total']);
+
+      // PRODUTOS
+      String combustivel = 'Combustível';
+      double litros = 0.0;
+      double valorUnit = 0.0;
+      double valorTotalItem = 0.0;
+
+      if (produtos.isNotEmpty) {
+        final prod = produtos[0];
+        combustivel = (prod['descricao'] ?? prod['item'] ?? 'Combustível')
+            .toString()
+            .trim();
+
+        litros = _toDouble(prod['quantidade_comercial']);
+        if (litros == 0) litros = _toDouble(prod['qtd']);
+        if (litros == 0) litros = _toDouble(prod['quantidade']);
+
+        valorTotalItem = _toDouble(prod['valor_produto']);
+        if (valorTotalItem == 0) valorTotalItem = _toDouble(prod['valor']);
+        if (valorTotalItem == 0)
+          valorTotalItem = _toDouble(prod['valor_total_item']);
+
+        valorUnit = _toDouble(prod['valor_unitario_comercial']);
+        if (valorUnit == 0) valorUnit = _toDouble(prod['valor_unitario']);
+        if (valorUnit == 0) valorUnit = _toDouble(prod['valor_unidade']);
+
+        if (valorUnit == 0 && litros > 0 && valorTotalItem > 0) {
+          valorUnit = valorTotalItem / litros;
         }
       }
 
-      // Dados do Item (pega o primeiro da lista)
-      final descricao =
-          document.querySelector('.txtTit')?.text.trim() ?? 'Combustível';
-
-      // Tratamento de números (troca vírgula por ponto)
-      String limpaNum(String? s) =>
-          s?.replaceAll(RegExp(r'[^0-9,]'), '').replaceAll(',', '.') ?? '0';
-
-      final qtd = limpaNum(document.querySelector('.Rqtd')?.text);
-      final vlUnit = limpaNum(document.querySelector('.RvlUnit')?.text);
-      final vlTotalNota = limpaNum(document.querySelector('.txtMax')?.text);
-
-      // Data Emissão
-      String dataEmissao = DateTime.now().toString().substring(0, 10);
-      final infos = document.querySelector('#infos')?.text ?? '';
-      final matchData = RegExp(r'(\d{2}/\d{2}/\d{4})').firstMatch(infos);
-      if (matchData != null) dataEmissao = matchData.group(1)!;
+      // PLACA
+      String placa = 'Não informado';
+      if (data['transporte']?['veiculo']?['placa'] != null) {
+        placa = data['transporte']['veiculo']['placa'];
+      } else {
+        String obs =
+            (data['observacoes'] ?? data['info_adicionais'] ?? '').toString();
+        final placaMatch =
+            RegExp(r'[A-Z]{3}[0-9][A-Z0-9][0-9]{2}', caseSensitive: false)
+                .firstMatch(obs);
+        if (placaMatch != null) placa = placaMatch.group(0)!.toUpperCase();
+      }
 
       return {
-        'emitente': {
-          'nome': nomePosto,
-          'cnpj': cnpjPosto,
-        },
-        'itens': [
-          {
-            'descricao': descricao,
-            'quantidade': double.tryParse(qtd) ?? 0.0,
-            'valor_unitario': double.tryParse(vlUnit) ?? 0.0,
-          }
-        ],
-        'valor_total': double.tryParse(vlTotalNota) ?? 0.0,
-        'data_emissao': dataEmissao,
+        "status": "OK",
+        "dados": {
+          "Data": dataEmissao,
+          "Posto": nomePosto,
+          "CNPJPosto": cnpjPuro,
+          "Cupom": cupom,
+          "Combustivel": combustivel,
+          "Placa": placa,
+          "ValorUnit": valorUnit,
+          "Litros": litros,
+          "ValorTotal": valorTotalNota,
+          "Quilometro": "Não informado",
+        }
       };
+    } catch (e) {
+      return {"status": "ERRO", "mensagem": "Erro leitura: $e"};
     }
+  }*/
 
-    // Retorno padrão caso não reconheça o layout
-    return {
-      'emitente': {'nome': 'Layout Desconhecido', 'cnpj': ''},
-      'itens': [],
-      'valor_total': 0.0,
-      'data_emissao': DateTime.now().toString(),
-    };
+  static Map<String, dynamic> _mapInfoSimplesToApp(Map<String, dynamic> data) {
+    try {
+      final emitente = data['emitente'] ?? {};
+      final nfe = data['nfe'] ?? {};
+      final infosNota = data['informacoes_nota'] ?? {};
+      final totais = data['totais'] ?? {};
+      final produtos = data['produtos'] as List? ?? [];
+
+      // 1. DATA (Mantendo a correção anterior)
+      String rawDate = data['data_hora_emissao'] ??
+          nfe['data_emissao'] ??
+          infosNota['data_emissao'] ??
+          data['data_emissao'] ??
+          DateTime.now().toString();
+
+      final dataEmissao = _formatarDataUniversal(rawDate);
+
+      // 2. DEMAIS DADOS
+      final cupom = nfe['numero']?.toString() ??
+          infosNota['numero']?.toString() ??
+          data['numero_cfe']?.toString() ??
+          '0';
+
+      // --- CORREÇÃO DO CNPJ (LIMPEZA TOTAL) ---
+      // Pega o valor de onde estiver disponível (normalizado ou sujo)
+      String rawCnpj = emitente['normalizado_cnpj']?.toString() ??
+          emitente['cnpj']?.toString() ??
+          '';
+
+      // Aplica a limpeza de TUDO que não for número (pontos, traços, barras, espaços)
+      final cnpjPuro = rawCnpj.replaceAll(RegExp(r'\D'), '');
+      // ----------------------------------------
+
+      final nomePosto = emitente['nome_fantasia'] ??
+          emitente['nome'] ??
+          emitente['nome_razao_social'] ??
+          'Posto';
+
+      double valorTotalNota = _toDouble(totais['normalizado_valor_nfe'] ??
+          totais['valor_nfe'] ??
+          data['normalizado_valor_total'] ??
+          data['valor_total']);
+
+      // 3. PRODUTOS
+      String combustivel = 'Combustível';
+      double litros = 0.0;
+      double valorUnit = 0.0;
+      double valorTotalItem = 0.0;
+
+      if (produtos.isNotEmpty) {
+        final prod = produtos[0];
+        combustivel = (prod['descricao'] ?? prod['item'] ?? 'Combustível')
+            .toString()
+            .trim();
+
+        litros = _toDouble(prod['quantidade_comercial']);
+        if (litros == 0) litros = _toDouble(prod['qtd']);
+        if (litros == 0) litros = _toDouble(prod['quantidade']);
+
+        valorTotalItem = _toDouble(prod['valor_produto']);
+        if (valorTotalItem == 0) valorTotalItem = _toDouble(prod['valor']);
+        if (valorTotalItem == 0)
+          valorTotalItem = _toDouble(prod['valor_total_item']);
+
+        valorUnit = _toDouble(prod['valor_unitario_comercial']);
+        if (valorUnit == 0) valorUnit = _toDouble(prod['valor_unitario']);
+        if (valorUnit == 0) valorUnit = _toDouble(prod['valor_unidade']);
+
+        if (valorUnit == 0 && litros > 0 && valorTotalItem > 0) {
+          valorUnit = valorTotalItem / litros;
+        }
+      }
+
+      // 4. PLACA
+      String placa = 'Não informado';
+      if (data['transporte']?['veiculo']?['placa'] != null) {
+        placa = data['transporte']['veiculo']['placa'];
+      } else {
+        String obs =
+            (data['observacoes'] ?? data['info_adicionais'] ?? '').toString();
+        final placaMatch =
+            RegExp(r'[A-Z]{3}[0-9][A-Z0-9][0-9]{2}', caseSensitive: false)
+                .firstMatch(obs);
+        if (placaMatch != null) placa = placaMatch.group(0)!.toUpperCase();
+      }
+
+      return {
+        "status": "OK",
+        "dados": {
+          "Data": dataEmissao,
+          "Posto": nomePosto,
+          "CNPJPosto": cnpjPuro, // Agora vai sempre limpo!
+          "Cupom": cupom,
+          "Combustivel": combustivel,
+          "Placa": placa,
+          "ValorUnit": valorUnit,
+          "Litros": litros,
+          "ValorTotal": valorTotalNota,
+          "Quilometro": "Não informado",
+        }
+      };
+    } catch (e) {
+      debugPrint("Erro parser: $e");
+      return {"status": "ERRO", "mensagem": "Erro ao ler dados do cupom"};
+    }
   }
 
-  static Future<Map<String, dynamic>> salvarAbastecimento(
-      Map<String, dynamic> dados) async {
+  static String _formatarDataUniversal(String input) {
+    try {
+      input = input.trim();
+      // 1. Data por extenso (SAT)
+      if (input.contains(' de ')) {
+        final meses = {
+          'janeiro': '01',
+          'fevereiro': '02',
+          'março': '03',
+          'abril': '04',
+          'maio': '05',
+          'junho': '06',
+          'julho': '07',
+          'agosto': '08',
+          'setembro': '09',
+          'outubro': '10',
+          'novembro': '11',
+          'dezembro': '12'
+        };
+        String limpa =
+            input.replaceAll(',', '').replaceAll('às', '').toLowerCase();
+        final parts = limpa.split(' ');
+        if (parts.length >= 5) {
+          String dia = parts[0].padLeft(2, '0');
+          String mesNome = parts[2];
+          String ano = parts[4];
+          String hora = parts.length > 5 ? parts[5] : "00:00:00";
+          String mesNumero = meses[mesNome] ?? '01';
+          return "$ano-$mesNumero-$dia $hora";
+        }
+      }
+      // 2. Data com Barras (DD/MM/AAAA)
+      if (input.contains('/')) {
+        final partesEspaco = input.split(' ');
+        final soData = partesEspaco[0];
+        final soHora = partesEspaco.length > 1 ? partesEspaco[1] : "";
+        final partsData = soData.split('/');
+        if (partsData.length == 3) {
+          String dia = partsData[0];
+          String mes = partsData[1];
+          String ano = partsData[2];
+          String horaFinal = soHora.isNotEmpty
+              ? soHora
+              : DateTime.now().toString().substring(11, 19);
+          return "$ano-$mes-$dia $horaFinal";
+        }
+      }
+      // 3. Data ISO
+      if (input.contains('-')) {
+        if (input.length <= 10) {
+          final hora = DateTime.now().toString().substring(11, 19);
+          return "$input $hora";
+        }
+        return input;
+      }
+      return DateTime.now().toString().substring(0, 19);
+    } catch (e) {
+      return DateTime.now().toString().substring(0, 19);
+    }
+  }
+
+  static double _toDouble(dynamic val) {
+    if (val == null) return 0.0;
+    if (val is num) return val.toDouble();
+    if (val is String) {
+      return double.tryParse(val.replaceAll(',', '.')) ?? 0.0;
+    }
+    return 0.0;
+  }
+
+  static Future<Map<String, dynamic>> salvarVariosAbastecimentos(
+      List<Map<String, dynamic>> lista) async {
     try {
       final response = await http.post(
-        Uri.parse("$baseUrl/salvar_abastecimento.php"),
+        Uri.parse("$baseUrl/salvar_varios.php"),
         headers: {"Content-Type": "application/json"},
-        body: json.encode(dados),
+        body: json.encode({"abastecimentos": lista}),
       );
       return json.decode(response.body);
     } catch (e) {
